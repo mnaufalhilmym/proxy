@@ -19,7 +19,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Decode the base64-encoded URL.
-	decodedBytes, err := base64.StdEncoding.DecodeString(encodedURL)
+	decodedBytes, err := base64.URLEncoding.DecodeString(encodedURL)
 	if err != nil {
 		http.Error(w, "Invalid base64 encoding: "+err.Error(), http.StatusBadRequest)
 		return
@@ -36,6 +36,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Log the incoming request.
 	log.Printf("Incoming request: %s %s from %s, proxying to %s", r.Method, r.URL.String(), r.RemoteAddr, upstreamURL)
 
+	// Determine if the "browse" query parameter is set.
+	browseEnabled := r.URL.Query().Get("browse") != ""
+
 	// Create a new request to the upstream server.
 	// Note: r.Body is already an io.ReadCloser, so it streams the body.
 	req, err := http.NewRequest(r.Method, upstreamURL, r.Body)
@@ -46,7 +49,11 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Copy all headers except "Host".
 	for key, values := range r.Header {
-		if strings.ToLower(key) == "host" {
+		keyLower := strings.ToLower(key)
+		if keyLower == "host" {
+			continue
+		}
+		if browseEnabled && keyLower == "accept-encoding" {
 			continue
 		}
 		for _, value := range values {
@@ -65,19 +72,77 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Log the upstream response status.
 	log.Printf("Upstream response: %d for %s", resp.StatusCode, upstreamURL)
 
-	// Copy upstream response headers.
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
+	// Build the proxy origin.
+	origin := "http://" + r.Host
+	if r.TLS != nil {
+		origin = "https://" + r.Host
+	}
+
+	// Helper function to copy headers, excluding Content-Length if browsing is enabled.
+	copyHeaders := func() {
+		for key, values := range resp.Header {
+			if browseEnabled && strings.ToLower(key) == "content-length" {
+				continue
+			}
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
 		}
 	}
 
-	// Set the status code.
-	w.WriteHeader(resp.StatusCode)
+	// Conditionally rewrite content if browsing is enabled.
+	contentType := resp.Header.Get("Content-Type")
+	if browseEnabled && strings.HasPrefix(contentType, "text/html") {
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "Error reading upstream HTML", http.StatusInternalServerError)
+			return
+		}
+		rewritten, err := rewriteHTML(bodyBytes, parsedURL, origin)
+		if err != nil {
+			http.Error(w, "Error rewriting HTML: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		copyHeaders()
+		w.WriteHeader(resp.StatusCode)
+		w.Write(rewritten)
+	} else if browseEnabled && strings.HasPrefix(contentType, "text/css") {
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "Error reading upstream CSS", http.StatusInternalServerError)
+			return
+		}
+		rewritten, err := rewriteCSS(bodyBytes, parsedURL, origin)
+		if err != nil {
+			http.Error(w, "Error rewriting CSS: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		copyHeaders()
+		w.WriteHeader(resp.StatusCode)
+		w.Write(rewritten)
+	} else if browseEnabled && (strings.HasPrefix(contentType, "application/javascript") || strings.HasPrefix(contentType, "text/javascript")) {
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "Error reading upstream JavaScript", http.StatusInternalServerError)
+			return
+		}
+		rewritten, err := rewriteJS(bodyBytes, parsedURL, origin)
+		if err != nil {
+			http.Error(w, "Error rewriting JavaScript: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		copyHeaders()
+		w.WriteHeader(resp.StatusCode)
+		w.Write(rewritten)
+	} else {
+		// For non-rewritten content, simply copy the response headers and stream the body.
+		copyHeaders()
+		w.WriteHeader(resp.StatusCode)
 
-	/// Stream the response body to the client.
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("Error streaming response: %v", err)
+		// Stream the response body to the client.
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			log.Printf("Error streaming response: %v", err)
+		}
 	}
 }
 
